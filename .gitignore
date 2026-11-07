@@ -1,0 +1,51 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Python virtual environments
+.venv/
+venv/
+env/
+**/.venv/
+**/venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Frontend dependencies
+node_modules/
+**/node_modules/
+
+# Frontend production builds
+dist/
+**/dist/
+
+# Build and test coverage
+coverage/
+*.log
+
+# IDE settings
+.vscode/
+.idea/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Local database and SQLite files
+*.sqlite
+*.sqlite3
+*.db
+
+# Certificates and private keys
+*.pem
+*.key
+*.p12
+*.pfx
