@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 FileShare — Secure Cloud File Sharing Platform
 
 FileShare is a full-stack web app where signed-in users upload files to a private cloud bucket and share them through an owner-approved access request flow. Nobody downloads another user's file without the owner's explicit approval, and that includes administrators. Every upload and download is measured, so admins (and each user, for their own activity) get real usage graphs.
@@ -191,3 +192,6 @@ Short-lived signed tickets. Download links are JWTs scoped to one user and one f
 Owner-controlled access. Access is granted per file, per requester, by the owner only.
 Safe downloads. Forced attachment downloads with nosniff and no-store headers.
 Blocked account checks. Inactive users cannot log in, use an existing token, or download via a ticket.
+=======
+
+>>>>>>> 6a76c03915f343f06770148e50e2843080ae7985
