@@ -151,7 +151,7 @@ export default function AdminAnalytics() {
     : null;
 
   return (
-    <section className="mb-8">
+    <section className="panel panel-purple">
       <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
         <div>
           <p className="text-sm font-medium text-purple-400">
@@ -163,7 +163,7 @@ export default function AdminAnalytics() {
           </h2>
 
           <p className="mt-1 text-sm text-slate-400">
-            Uploads, downloads, speed, storage and user activity.
+            Average upload and download speed, volume, storage and user activity.
           </p>
         </div>
 
@@ -220,14 +220,18 @@ export default function AdminAnalytics() {
         >
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             <Summary
-              label="Uploads"
-              value={sum(data.uploads.count)}
-              detail="In the period shown"
+              label="Average upload speed"
+              value={formatSpeed(
+                data.summary?.uploads?.average_speed_bytes_per_second
+              )}
+              detail={`${sum(data.uploads.count)} uploads in the period`}
             />
             <Summary
-              label="Downloads"
-              value={sum(data.downloads.count)}
-              detail="In the period shown"
+              label="Average download speed"
+              value={formatSpeed(
+                data.summary?.downloads?.average_speed_bytes_per_second
+              )}
+              detail={`${sum(data.downloads.count)} downloads in the period`}
             />
             <Summary
               label="Uploaded"
@@ -244,7 +248,7 @@ export default function AdminAnalytics() {
           <div className="grid gap-4 lg:grid-cols-2">
             <Panel>
               <Chart
-                title="Upload & download activity"
+                title="Uploads & downloads per period"
                 type="bar"
                 labels={data.labels}
                 formatLabel={labelFormatter}
@@ -271,14 +275,26 @@ export default function AdminAnalytics() {
 
             <Panel>
               <Chart
-                title="Upload & download speed"
+                title="Average upload speed"
                 labels={data.labels}
                 formatLabel={labelFormatter}
                 formatValue={formatSpeed}
-                emptyText="No timed transfers in this period yet."
+                emptyText="No timed uploads in this period yet."
                 series={[
-                  { name: "Upload speed", color: UPLOAD_COLOR, values: data.uploads.speed_bytes_per_second },
-                  { name: "Download speed", color: DOWNLOAD_COLOR, values: data.downloads.speed_bytes_per_second },
+                  { name: "Average upload speed", color: UPLOAD_COLOR, values: data.uploads.speed_bytes_per_second },
+                ]}
+              />
+            </Panel>
+
+            <Panel>
+              <Chart
+                title="Average download speed"
+                labels={data.labels}
+                formatLabel={labelFormatter}
+                formatValue={formatSpeed}
+                emptyText="No timed downloads in this period yet."
+                series={[
+                  { name: "Average download speed", color: DOWNLOAD_COLOR, values: data.downloads.speed_bytes_per_second },
                 ]}
               />
             </Panel>

@@ -1,12 +1,15 @@
 from datetime import timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from app import analytics
+from app.company import quota_for
 from app.database import get_db
 from app.models import Movie, TransferEvent, User
+from app.routers.auth import hash_password
 from app.routers.routes import get_current_user
 from app.sqlhelpers import bucket_of, utc
 
@@ -85,6 +88,8 @@ def list_users(
             User.id,
             User.name,
             User.email,
+            User.employee_id,
+            User.storage_quota_bytes,
             User.role,
             User.is_active,
             User.created_at,
@@ -102,6 +107,8 @@ def list_users(
             User.id,
             User.name,
             User.email,
+            User.employee_id,
+            User.storage_quota_bytes,
             User.role,
             User.is_active,
             User.created_at,
@@ -118,9 +125,11 @@ def list_users(
                 "id": user.id,
                 "name": user.name,
                 "email": user.email,
+                "employee_id": user.employee_id,
                 "role": user.role,
                 "is_active": user.is_active,
                 "created_at": user.created_at,
+                "quota_bytes": quota_for(user),
                 "movies_uploaded": user.movies_uploaded,
                 "storage_used_bytes": int(
                     user.storage_used_bytes or 0
@@ -131,6 +140,120 @@ def list_users(
     return {
         "total": len(users),
         "users": users,
+    }
+
+
+# --------------------------------------------------
+# 3a. ADD AN EMPLOYEE / CHANGE A STORAGE QUOTA
+# --------------------------------------------------
+
+class NewEmployee(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    employee_id: str = Field(min_length=1, max_length=30)
+    email: EmailStr
+    password: str = Field(min_length=8)
+    # Optional: leave out for the company default.
+    quota_mb: int | None = Field(default=None, ge=1, le=1_000_000)
+
+
+class QuotaChange(BaseModel):
+    quota_mb: int = Field(ge=1, le=1_000_000)
+
+
+@router.post("/users", status_code=status.HTTP_201_CREATED)
+def add_employee(
+    data: NewEmployee,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Create an employee account. Only the administrator can do this."""
+
+    name = data.name.strip()
+    employee_id = data.employee_id.strip()
+    email = str(data.email).strip().lower()
+
+    if not name or not employee_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Name and employee ID are required.",
+        )
+
+    if db.query(User).filter(User.employee_id == employee_id).first():
+        raise HTTPException(
+            status_code=409,
+            detail="That employee ID already has an account.",
+        )
+
+    if db.query(User).filter(User.email == email).first():
+        raise HTTPException(
+            status_code=409,
+            detail="That email already has an account.",
+        )
+
+    employee = User(
+        name=name,
+        email=email,
+        employee_id=employee_id,
+        password_hash=hash_password(data.password),
+        role="user",
+        is_active=True,
+        storage_quota_bytes=(
+            data.quota_mb * 1024 * 1024 if data.quota_mb else None
+        ),
+    )
+
+    try:
+        db.add(employee)
+        db.commit()
+        db.refresh(employee)
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Could not create the employee account.",
+        )
+
+    return {
+        "message": f"{name} was added.",
+        "user": {
+            "id": employee.id,
+            "name": employee.name,
+            "email": employee.email,
+            "employee_id": employee.employee_id,
+            "role": employee.role,
+        },
+    }
+
+
+@router.patch("/users/{user_id}/quota")
+def change_quota(
+    user_id: int,
+    data: QuotaChange,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Set how much storage one employee may use."""
+
+    user = db.query(User).filter(User.id == user_id).first()
+
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    user.storage_quota_bytes = data.quota_mb * 1024 * 1024
+
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Could not change the storage quota.",
+        )
+
+    return {
+        "message": f"{user.name} now has {data.quota_mb} MB.",
+        "user_id": user.id,
+        "quota_bytes": user.storage_quota_bytes,
     }
 
 
@@ -391,6 +514,49 @@ def admin_analytics(
 
     first_event = db.query(func.min(TransferEvent.created_at)).scalar()
 
+    # Headline averages over everything shown in the graphs: total bytes
+    # divided by total time of the timed, completed transfers (so one huge
+    # slow file counts for more than a tiny fast one, as it should).
+    overall_rows = (
+        db.query(
+            TransferEvent.kind,
+            total(case((done, 1), else_=0)).label("transfers"),
+            total(case((timed, TransferEvent.bytes_transferred), else_=0))
+            .label("timed_bytes"),
+            total(case((timed, TransferEvent.duration_ms), else_=0))
+            .label("timed_ms"),
+            total(case((timed, 1), else_=0)).label("timed_count"),
+        )
+        .filter(utc(TransferEvent.created_at) >= first_start)
+        .group_by(TransferEvent.kind)
+        .all()
+    )
+
+    summary = {
+        kind: {
+            "transfers": 0,
+            "average_speed_bytes_per_second": None,
+            "average_duration_ms": None,
+        }
+        for kind in ("uploads", "downloads")
+    }
+
+    for row in overall_rows:
+        key = {"upload": "uploads", "download": "downloads"}.get(row.kind)
+
+        if key is None:
+            continue
+
+        summary[key] = {
+            "transfers": int(row.transfers),
+            "average_speed_bytes_per_second": analytics.speed_bytes_per_second(
+                int(row.timed_bytes), int(row.timed_ms)
+            ),
+            "average_duration_ms": analytics.average_ms(
+                int(row.timed_ms), int(row.timed_count)
+            ),
+        }
+
     def aligned(kind, field, default):
         return analytics.align(starts, series[kind][field], default)
 
@@ -400,6 +566,7 @@ def admin_analytics(
         "tracking_since": (
             first_event.isoformat() if first_event else None
         ),
+        "summary": summary,
         "uploads": {
             "count": aligned("upload", "count", 0),
             "bytes": aligned("upload", "bytes", 0),
@@ -531,6 +698,23 @@ def admin_download_history(
         .all()
     )
 
+    # Private files stay private from the administrator too: their names
+    # are replaced, because only the owner may see them.
+    shown_ids = [e.movie_id for e in events if e.movie_id is not None]
+
+    private_ids = set()
+
+    if shown_ids:
+        private_ids = {
+            row[0]
+            for row in db.query(Movie.id)
+            .filter(
+                Movie.id.in_(shown_ids),
+                Movie.visibility == "private",
+            )
+            .all()
+        }
+
     return {
         "total": total,
         "limit": limit,
@@ -539,7 +723,11 @@ def admin_download_history(
             {
                 "id": event.id,
                 "movie_id": event.movie_id,
-                "movie_title": event.movie_title,
+                "movie_title": (
+                    "Private file"
+                    if event.movie_id in private_ids
+                    else event.movie_title
+                ),
                 "user_id": event.user_id,
                 "user_name": event.user_name,
                 "bytes_transferred": int(event.bytes_transferred),

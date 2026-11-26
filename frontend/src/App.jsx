@@ -1,23 +1,32 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   getAdminDashboard,
   getCurrentUser,
-  getMovieDownloadUrl,
   deleteMovie,
+  downloadMovieFile,
+  errorMessage,
   getMovies,
+  saveBlob,
   searchMovies,
+  setMovieVisibility,
   logoutUser,
   uploadMovie,
-  getSharingNotifications,
-  decideSharingRequest,
 } from "./services/api";
+import { RateMeter } from "./services/rate";
 
 import Header from "./components/Header";
+import MessagesPanel from "./components/MessagesPanel";
+import ChangePasswordDialog from "./components/ChangePasswordDialog";
+import TransferPanel from "./components/TransferPanel";
 import LoginPage from "./pages/LoginPage";
 import DashboardPage from "./pages/DashboardPage";
 
 import "./App.css";
+
+// How long a finished transfer stays in the panel.
+// A finished transfer card closes itself after this long.
+const DONE_VISIBLE_MS = 2500;
 
 function App() {
   // --------------------------------------------------
@@ -27,8 +36,17 @@ function App() {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
 
+  // Storage used and allowed, shown as a bar on the drive.
+  const [storage, setStorage] = useState(null);
+
+  // Pop-ups, and the tab a notification asked for.
+  const [messagesOpen, setMessagesOpen] = useState(null);
+  const [passwordOpen, setPasswordOpen] = useState(false);
+  const [requestedTab, setRequestedTab] = useState(null);
+  const [bellKey, setBellKey] = useState(0);
+
   // --------------------------------------------------
-  // 2. Movie data
+  // 2. File data
   // --------------------------------------------------
 
   const [movies, setMovies] = useState([]);
@@ -46,9 +64,15 @@ function App() {
   // --------------------------------------------------
 
   const [loadingMovies, setLoadingMovies] = useState(false);
-  const [uploading, setUploading] = useState(false);
-  const [downloadingMovieId, setDownloadingMovieId] = useState(null);
   const [deletingMovieId, setDeletingMovieId] = useState(null);
+  const [togglingMovieId, setTogglingMovieId] = useState(null);
+
+  // Uploads and downloads in progress (or just finished), each with its
+  // live speed. See components/TransferPanel.jsx.
+  const [transfers, setTransfers] = useState([]);
+  const meters = useRef({});
+  const histories = useRef({});
+  const controllers = useRef({});
 
   // --------------------------------------------------
   // 4. General messages
@@ -58,16 +82,114 @@ function App() {
   const [message, setMessage] = useState("");
 
   // --------------------------------------------------
-  // 5. Movie-sharing notifications
+  // 5. Transfer bookkeeping
   // --------------------------------------------------
 
-  const [sharingNotifications, setSharingNotifications] = useState([]);
-  const [loadingSharingNotifications, setLoadingSharingNotifications] =
-    useState(false);
-  const [sharingActionId, setSharingActionId] = useState(null);
+  const addTransfer = useCallback((transfer) => {
+    setTransfers((list) => [...list, transfer]);
+  }, []);
+
+  const patchTransfer = useCallback((id, patch) => {
+    setTransfers((list) =>
+      list.map((item) => (item.id === id ? { ...item, ...patch } : item))
+    );
+  }, []);
+
+  const dismissTransfer = useCallback((id) => {
+    setTransfers((list) => list.filter((item) => item.id !== id));
+    delete meters.current[id];
+    delete histories.current[id];
+    delete controllers.current[id];
+  }, []);
+
+  // A progress event arrived: update the numbers and the live speed.
+  const reportProgress = useCallback(
+    (id, { loaded, total }) => {
+      const meter = meters.current[id];
+
+      if (!meter) return;
+
+      const now = performance.now();
+
+      meter.push(loaded, now);
+
+      // Keep the last readings so the card can draw a live speed graph.
+      const history = histories.current[id] || (histories.current[id] = []);
+      const rate = meter.rate(now);
+
+      // One reading about every half second: { t: seconds since start, rate }.
+      const t = (now - meter.startedAt) / 1000;
+      const lastT = history.length ? history[history.length - 1].t : -1;
+
+      if (t - lastT >= 0.5) history.push({ t, rate });
+      if (history.length > 1200) history.shift();
+
+      const patch = {
+        loaded,
+        rate,
+        history: [...history],
+        lastEventAt: now,
+      };
+
+      // Keep the known size when an event does not carry one.
+      if (total) patch.total = total;
+
+      patchTransfer(id, patch);
+    },
+    [patchTransfer]
+  );
+
+  const finishTransfer = useCallback(
+    (id, patch) => {
+      const meter = meters.current[id];
+      const now = performance.now();
+
+      patchTransfer(id, {
+        ...patch,
+        rate: 0,
+        durationMs: meter?.startedAt != null ? now - meter.startedAt : null,
+      });
+
+      if (patch.status === "done") {
+        window.setTimeout(() => dismissTransfer(id), DONE_VISIBLE_MS);
+      }
+    },
+    [patchTransfer, dismissTransfer]
+  );
+
+  const newTransfer = (kind, name, total) => {
+    const id = `${kind}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const meter = new RateMeter();
+    const now = performance.now();
+
+    meter.start(now);
+    meters.current[id] = meter;
+
+    addTransfer({
+      id,
+      kind,
+      name,
+      loaded: 0,
+      total: total || 0,
+      history: [],
+      startedAt: now,
+      rate: 0,
+      averageRate: 0,
+      durationMs: null,
+      status: "active",
+      error: "",
+      lastEventAt: now,
+    });
+
+    return id;
+  };
+
+  const cancelTransfer = useCallback((id) => {
+    controllers.current[id]?.abort();
+  }, []);
 
   // --------------------------------------------------
-  // 6. Load movies
+  // 6. Load files
   // --------------------------------------------------
 
   const loadMovies = useCallback(async () => {
@@ -78,6 +200,15 @@ function App() {
       setMovies(data.movies || []);
     } finally {
       setLoadingMovies(false);
+    }
+  }, []);
+
+  const refreshStorage = useCallback(async () => {
+    try {
+      const me = await getCurrentUser();
+      setStorage(me.storage || null);
+    } catch (err) {
+      console.error("Could not refresh storage:", err);
     }
   }, []);
 
@@ -95,94 +226,13 @@ function App() {
       const data = await getAdminDashboard();
       setAdminStats(data.statistics || null);
     } catch (err) {
-      console.error(
-        "Could not load administrator statistics:",
-        err
-      );
-
+      console.error("Could not load administrator statistics:", err);
       setAdminStats(null);
     }
   }, [user]);
 
   // --------------------------------------------------
-  // 8. Load movie-sharing notifications
-  // --------------------------------------------------
-
-  const loadSharingNotifications = useCallback(async () => {
-    if (!user) {
-      setSharingNotifications([]);
-      return;
-    }
-
-    setLoadingSharingNotifications(true);
-
-    try {
-      const data = await getSharingNotifications();
-      setSharingNotifications(data.notifications || []);
-    } catch (err) {
-      console.error(
-        "Could not load sharing notifications:",
-        err
-      );
-
-      setError(
-        "Could not load sharing notifications. Please refresh."
-      );
-    } finally {
-      setLoadingSharingNotifications(false);
-    }
-  }, [user]);
-
-  // --------------------------------------------------
-  // 9. Accept or reject a sharing request
-  // --------------------------------------------------
-
-  const handleSharingDecision = async (requestId, decision) => {
-    setError("");
-    setMessage("");
-    setSharingActionId(requestId);
-
-    try {
-      const result = await decideSharingRequest(
-        requestId,
-        decision
-      );
-
-      setMessage(
-        result.message ||
-          `File access request ${decision} successfully.`
-      );
-
-      await loadSharingNotifications();
-    } catch (err) {
-      console.error(
-        "Could not update sharing request:",
-        err
-      );
-
-      const detail = err.response?.data?.detail;
-
-      setError(
-        typeof detail === "string"
-          ? detail
-          : "Could not update the access request. Please try again."
-      );
-
-      try {
-        await loadSharingNotifications();
-      } catch (refreshError) {
-        console.error(
-          "Could not refresh sharing notifications:",
-          refreshError
-        );
-      }
-    } finally {
-      setSharingActionId(null);
-    }
-  };
-
-  // --------------------------------------------------
-  // 10. Refresh dashboard information
+  // 8. Refresh dashboard information
   // --------------------------------------------------
 
   const loadDashboard = useCallback(async () => {
@@ -193,9 +243,7 @@ function App() {
     } catch (err) {
       console.error("Could not load files:", err);
 
-      setError(
-        "Could not load files. Please refresh and try again."
-      );
+      setError("Could not load files. Please refresh and try again.");
     }
 
     if (user?.role === "admin") {
@@ -204,7 +252,7 @@ function App() {
   }, [loadMovies, loadAdminStats, user]);
 
   // --------------------------------------------------
-  // 11. Restore login session
+  // 9. Restore login session
   // --------------------------------------------------
 
   useEffect(() => {
@@ -222,13 +270,11 @@ function App() {
         const currentUser = await getCurrentUser();
 
         if (!cancelled) {
+          setStorage(currentUser.storage || null);
           setUser(currentUser);
         }
       } catch (err) {
-        console.error(
-          "Could not restore login session:",
-          err
-        );
+        console.error("Could not restore login session:", err);
 
         logoutUser();
       } finally {
@@ -246,22 +292,17 @@ function App() {
   }, []);
 
   // --------------------------------------------------
-  // 12. Load dashboard and notifications after login
+  // 10. Load dashboard after login
   // --------------------------------------------------
 
   useEffect(() => {
     if (user) {
       loadDashboard();
-      loadSharingNotifications();
     }
-  }, [
-    user,
-    loadDashboard,
-    loadSharingNotifications,
-  ]);
+  }, [user, loadDashboard]);
 
   // --------------------------------------------------
-  // 13. Handle successful login
+  // 11. Handle successful login
   // --------------------------------------------------
 
   const handleLogin = (loggedInUser) => {
@@ -270,23 +311,25 @@ function App() {
 
     setMovies([]);
     setAdminStats(null);
-    setSharingNotifications([]);
 
     setSearchQuery("");
     setSearchResults([]);
     setSearchError("");
     setHasSearched(false);
 
+    setStorage(loggedInUser.storage || null);
     setUser(loggedInUser);
   };
 
   // --------------------------------------------------
-  // 14. Handle movie uploads
+  // 12. Upload (with live speed)
   // --------------------------------------------------
 
   const handleUpload = async ({
     title,
     description,
+    visibility,
+    recipients = [],
     file,
   }) => {
     setError("");
@@ -297,18 +340,30 @@ function App() {
       return false;
     }
 
-    setUploading(true);
+    const id = newTransfer("upload", file.name, file.size);
 
     try {
       const result = await uploadMovie({
         title,
         description,
+        visibility,
+        recipients,
         file,
+        onProgress: (progress) => reportProgress(id, progress),
       });
 
-      setMessage(
-        result.message || "File uploaded successfully!"
-      );
+      refreshStorage();
+
+      const sendSeconds = (result.send_ms || 1) / 1000;
+
+      finishTransfer(id, {
+        status: "done",
+        loaded: file.size,
+        total: file.size,
+        averageRate: file.size / sendSeconds,
+      });
+
+      setMessage(result.message || "File uploaded successfully!");
 
       try {
         await loadMovies();
@@ -331,22 +386,20 @@ function App() {
     } catch (err) {
       console.error("File upload failed:", err);
 
-      const detail = err.response?.data?.detail;
-
-      setError(
-        typeof detail === "string"
-          ? detail
-          : "File upload failed. Please check the file and try again."
+      const text = await errorMessage(
+        err,
+        "File upload failed. Please check the file and try again."
       );
 
+      finishTransfer(id, { status: "error", error: text });
+      setError(text);
+
       return false;
-    } finally {
-      setUploading(false);
     }
   };
 
   // --------------------------------------------------
-  // 15. Search movies
+  // 13. Search files
   // --------------------------------------------------
 
   const handleSearch = async () => {
@@ -354,9 +407,7 @@ function App() {
 
     if (!query) {
       setSearchResults([]);
-      setSearchError(
-        "Please enter a file title or keyword."
-      );
+      setSearchError("Please enter a file title or keyword.");
       setHasSearched(true);
       return;
     }
@@ -385,10 +436,6 @@ function App() {
     }
   };
 
-  // --------------------------------------------------
-  // 16. Clear movie search
-  // --------------------------------------------------
-
   const handleClearSearch = () => {
     setSearchQuery("");
     setSearchResults([]);
@@ -397,46 +444,66 @@ function App() {
   };
 
   // --------------------------------------------------
-  // 17. Handle movie downloads
+  // 14. Download (with live speed)
   // --------------------------------------------------
 
-  const handleDownload = async (movieId) => {
+  const handleDownload = async (movie) => {
     setError("");
     setMessage("");
 
-    setDownloadingMovieId(movieId);
+    // One download of the same file at a time.
+    const alreadyRunning = transfers.some(
+      (item) =>
+        item.kind === "download" &&
+        item.status === "active" &&
+        item.movieId === movie.id
+    );
+
+    if (alreadyRunning) return;
+
+    const id = newTransfer("download", movie.title, movie.file_size);
+    patchTransfer(id, { movieId: movie.id });
+
+    const controller = new AbortController();
+    controllers.current[id] = controller;
 
     try {
-      const result = await getMovieDownloadUrl(movieId);
+      const { blob, filename } = await downloadMovieFile(movie.id, {
+        signal: controller.signal,
+        onProgress: (progress) => reportProgress(id, progress),
+      });
 
-      if (!result.download_url) {
-        throw new Error(
-          "The server did not return a download URL."
-        );
+      const meter = meters.current[id];
+      const averageRate = meter ? meter.average(performance.now()) : 0;
+
+      saveBlob(blob, filename);
+
+      finishTransfer(id, {
+        status: "done",
+        loaded: blob.size,
+        total: blob.size,
+        averageRate,
+      });
+    } catch (err) {
+      if (controller.signal.aborted) {
+        finishTransfer(id, { status: "cancelled" });
+        return;
       }
 
-      // Navigate in the same tab instead of window.open(): this runs after
-      // an await, so phone browsers treat a new window as a pop-up and
-      // block it. The download link sends "Content-Disposition:
-      // attachment", so the browser saves the file and stays on this page.
-      window.location.assign(result.download_url);
-    } catch (err) {
       console.error("File download failed:", err);
 
-      const detail = err.response?.data?.detail;
-
-      setError(
-        typeof detail === "string"
-          ? detail
-          : "Could not generate the file download link. Please try again."
+      const text = await errorMessage(
+        err,
+        "Could not download the file. Please try again."
       );
-    } finally {
-      setDownloadingMovieId(null);
+
+      finishTransfer(id, { status: "error", error: text });
+      setError(text);
     }
   };
 
   // --------------------------------------------------
-  // 17b. Handle file deletion (owner only)
+  // 15. Delete a file (owner only)
   // --------------------------------------------------
 
   const handleDelete = async (movieId) => {
@@ -448,16 +515,13 @@ function App() {
     try {
       const result = await deleteMovie(movieId);
 
-      // Remove the file from the lists straight away.
       const stillThere = (movie) => Number(movie.id) !== Number(movieId);
 
       setMovies((previous) => previous.filter(stillThere));
       setSearchResults((previous) => previous.filter(stillThere));
 
       setMessage(result.message || "File deleted.");
-
-      // Requests for the deleted file are gone too.
-      loadSharingNotifications();
+      refreshStorage();
 
       if (user?.role === "admin") {
         loadAdminStats();
@@ -478,16 +542,84 @@ function App() {
   };
 
   // --------------------------------------------------
-  // 18. Handle logout
+  // 16. Make a file public or private (owner only)
+  // --------------------------------------------------
+
+  const handleToggleVisibility = async (movieId, visibility, recipients = []) => {
+    setError("");
+    setMessage("");
+
+    setTogglingMovieId(movieId);
+
+    try {
+      const result = await setMovieVisibility(movieId, visibility, recipients);
+
+      const apply = (movie) =>
+        Number(movie.id) === Number(movieId)
+          ? {
+              ...movie,
+              visibility: result.visibility,
+              shared_with: result.shared_with || [],
+            }
+          : movie;
+
+      setMovies((previous) => previous.map(apply));
+      setSearchResults((previous) => previous.map(apply));
+
+      setMessage(result.message || "Visibility updated.");
+      return true;
+    } catch (err) {
+      console.error("Could not change visibility:", err);
+
+      setError(
+        await errorMessage(
+          err,
+          "Could not change who can see the file. Please try again."
+        )
+      );
+      return false;
+    } finally {
+      setTogglingMovieId(null);
+    }
+  };
+
+  // --------------------------------------------------
+  // 16b. A notification was clicked
+  // --------------------------------------------------
+
+  const handleOpenNotification = (item) => {
+    if (item.type === "message") {
+      setMessagesOpen("inbox");
+    } else {
+      setRequestedTab({
+        key: item.type === "shared_file" ? "shared" : "public",
+        nonce: Date.now(),
+      });
+    }
+
+    // New files may have arrived since the page loaded.
+    loadMovies().catch(() => null);
+  };
+
+  // --------------------------------------------------
+  // 17. Handle logout
   // --------------------------------------------------
 
   const handleLogout = () => {
+    // Stop anything still downloading.
+    Object.values(controllers.current).forEach((controller) =>
+      controller.abort()
+    );
+
     logoutUser();
 
     setUser(null);
+    setStorage(null);
+    setMessagesOpen(null);
+    setPasswordOpen(false);
     setMovies([]);
     setAdminStats(null);
-    setSharingNotifications([]);
+    setTransfers([]);
 
     setSearchQuery("");
     setSearchResults([]);
@@ -499,7 +631,7 @@ function App() {
   };
 
   // --------------------------------------------------
-  // 19. Display session-loading screen
+  // 18. Session-loading screen
   // --------------------------------------------------
 
   if (loading) {
@@ -508,12 +640,10 @@ function App() {
         <div className="text-center">
           <div className="mx-auto mb-4 h-10 w-10 animate-spin rounded-full border-4 border-slate-600 border-t-white" />
 
-          <p className="text-lg font-medium">
-            Checking your session...
-          </p>
+          <p className="text-lg font-medium">Checking your session...</p>
 
           <p className="mt-2 text-sm text-slate-400">
-            Please wait while MovieShare loads.
+            Please wait while FileShare loads.
           </p>
         </div>
       </div>
@@ -521,7 +651,7 @@ function App() {
   }
 
   // --------------------------------------------------
-  // 20. Display login page
+  // 19. Login page
   // --------------------------------------------------
 
   if (!user) {
@@ -529,14 +659,26 @@ function App() {
   }
 
   // --------------------------------------------------
-  // 21. Display authenticated dashboard
+  // 20. Authenticated dashboard
   // --------------------------------------------------
+
+  const activeUpload = transfers.find(
+    (item) => item.kind === "upload" && item.status === "active"
+  );
+
+  const downloadingIds = transfers
+    .filter((item) => item.kind === "download" && item.status === "active")
+    .map((item) => item.movieId);
 
   return (
     <div className="min-h-screen bg-slate-950 text-white">
       <Header
         user={user}
         onLogout={handleLogout}
+        onOpenNotification={handleOpenNotification}
+        onOpenMessages={() => setMessagesOpen("inbox")}
+        onChangePassword={() => setPasswordOpen(true)}
+        bellRefreshKey={bellKey}
       />
 
       <DashboardPage
@@ -544,13 +686,22 @@ function App() {
         movies={movies}
         adminStats={adminStats}
         loadingMovies={loadingMovies}
-        uploading={uploading}
-        downloadingMovieId={downloadingMovieId}
+        uploading={Boolean(activeUpload)}
+        uploadProgress={
+          activeUpload
+            ? { loaded: activeUpload.loaded, total: activeUpload.total }
+            : null
+        }
+        downloadingIds={downloadingIds}
+        deletingMovieId={deletingMovieId}
+        togglingMovieId={togglingMovieId}
         onUpload={handleUpload}
         onDownload={handleDownload}
         onDelete={handleDelete}
-        deletingMovieId={deletingMovieId}
+        onToggleVisibility={handleToggleVisibility}
         onRefresh={loadDashboard}
+        storage={storage}
+        requestedTab={requestedTab}
         message={message}
         error={error}
         searchQuery={searchQuery}
@@ -561,13 +712,29 @@ function App() {
         hasSearched={hasSearched}
         onSearch={handleSearch}
         onClearSearch={handleClearSearch}
-        sharingNotifications={sharingNotifications}
-        loadingSharingNotifications={
-          loadingSharingNotifications
-        }
-        sharingActionId={sharingActionId}
-        onSharingDecision={handleSharingDecision}
-        onRefreshNotifications={loadSharingNotifications}
+      />
+
+      {messagesOpen && (
+        <MessagesPanel
+          initialTab={messagesOpen}
+          myFiles={movies.filter((movie) => movie.is_owner)}
+          onDownload={handleDownload}
+          onChanged={(info) => {
+            setBellKey((value) => value + 1);
+            if (info?.filesChanged) loadMovies().catch(() => null);
+          }}
+          onClose={() => setMessagesOpen(null)}
+        />
+      )}
+
+      {passwordOpen && (
+        <ChangePasswordDialog onClose={() => setPasswordOpen(false)} />
+      )}
+
+      <TransferPanel
+        transfers={transfers}
+        onCancel={cancelTransfer}
+        onDismiss={dismissTransfer}
       />
     </div>
   );

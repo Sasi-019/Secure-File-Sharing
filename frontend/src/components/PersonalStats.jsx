@@ -33,10 +33,10 @@ export default function PersonalStats({ refreshKey = 0 }) {
   }, [load, refreshKey]);
 
   return (
-    <section className="mb-8 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 sm:p-6">
+    <section className="panel panel-emerald">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div>
-          <p className="text-sm font-medium uppercase tracking-wider text-indigo-400">
+          <p className="text-sm font-medium uppercase tracking-wider text-emerald-300">
             Your activity
           </p>
 

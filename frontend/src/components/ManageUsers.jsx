@@ -1,7 +1,10 @@
 import { useEffect, useState } from "react";
 import {
+  addEmployee,
+  errorMessage,
   getAdminUsers,
   blockUser,
+  setUserQuota,
   unblockUser,
 } from "../services/api";
 
@@ -12,6 +15,72 @@ export default function ManageUsers() {
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [selectedUser, setSelectedUser] = useState(null);
+
+  // "Add employee" form and the quota editor.
+  const [showAdd, setShowAdd] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [form, setForm] = useState({
+    name: "",
+    employeeId: "",
+    email: "",
+    password: "",
+    quotaMb: "",
+  });
+  const [quotaInput, setQuotaInput] = useState("");
+
+  const setField = (key) => (event) =>
+    setForm((previous) => ({ ...previous, [key]: event.target.value }));
+
+  const handleAdd = async (event) => {
+    event.preventDefault();
+    setError("");
+    setMessage("");
+    setAdding(true);
+
+    try {
+      const result = await addEmployee({
+        name: form.name.trim(),
+        employeeId: form.employeeId.trim(),
+        email: form.email.trim(),
+        password: form.password,
+        quotaMb: form.quotaMb ? Number(form.quotaMb) : null,
+      });
+
+      setMessage(
+        `${result.message} They can sign in with employee ID ${result.user.employee_id}.`
+      );
+      setForm({ name: "", employeeId: "", email: "", password: "", quotaMb: "" });
+      setShowAdd(false);
+      await loadUsers();
+    } catch (err) {
+      setError(await errorMessage(err, "Could not add the employee."));
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const handleQuota = async (user) => {
+    const mb = Number(quotaInput);
+
+    if (!Number.isFinite(mb) || mb < 1) {
+      setError("Enter the storage in megabytes (1 or more).");
+      return;
+    }
+
+    try {
+      setActionLoading(true);
+      setError("");
+      setMessage("");
+      const result = await setUserQuota(user.id, Math.round(mb));
+      setMessage(result.message);
+      setQuotaInput("");
+      await loadUsers();
+    } catch (err) {
+      setError(await errorMessage(err, "Could not change the storage."));
+    } finally {
+      setActionLoading(false);
+    }
+  };
 
   // Convert storage bytes into a readable size.
   const formatStorage = (bytes) => {
@@ -121,7 +190,7 @@ export default function ManageUsers() {
   };
 
   return (
-    <section className="mb-10">
+    <section className="panel panel-purple">
       {/* Section heading */}
       <div className="mb-5 flex flex-wrap items-center justify-between gap-4">
         <div>
@@ -134,10 +203,17 @@ export default function ManageUsers() {
           </h2>
 
           <p className="mt-1 text-sm text-slate-400">
-            View registered accounts, inspect contributions, and manage
-            account access.
+            Add employees, set their storage, and manage account access.
           </p>
         </div>
+
+        <button
+          type="button"
+          onClick={() => setShowAdd((value) => !value)}
+          className="rounded-xl bg-purple-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-purple-500"
+        >
+          {showAdd ? "Cancel" : "＋ Add employee"}
+        </button>
 
         <button
           type="button"
@@ -151,6 +227,49 @@ export default function ManageUsers() {
           {loading ? "Loading..." : "↻ Refresh users"}
         </button>
       </div>
+
+      {showAdd && (
+        <form
+          onSubmit={handleAdd}
+          className="mb-5 grid gap-4 rounded-2xl border border-purple-500/30 bg-slate-900 p-5 sm:grid-cols-2"
+        >
+          <label className="text-sm text-slate-300">
+            Full name
+            <input required value={form.name} onChange={setField("name")} maxLength={100}
+              className="mt-2 w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm text-white outline-none focus:border-purple-500" />
+          </label>
+          <label className="text-sm text-slate-300">
+            Employee ID (ID card number)
+            <input required value={form.employeeId} onChange={setField("employeeId")} maxLength={30}
+              className="mt-2 w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm text-white outline-none focus:border-purple-500" />
+          </label>
+          <label className="text-sm text-slate-300">
+            Company email
+            <input required type="email" value={form.email} onChange={setField("email")}
+              className="mt-2 w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm text-white outline-none focus:border-purple-500" />
+          </label>
+          <label className="text-sm text-slate-300">
+            First password (8+ characters)
+            <input required type="text" minLength={8} value={form.password} onChange={setField("password")}
+              className="mt-2 w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm text-white outline-none focus:border-purple-500" />
+          </label>
+          <label className="text-sm text-slate-300">
+            Storage in MB (leave empty for the company default)
+            <input type="number" min="1" value={form.quotaMb} onChange={setField("quotaMb")}
+              className="mt-2 w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm text-white outline-none focus:border-purple-500" />
+          </label>
+          <div className="flex items-end">
+            <button type="submit" disabled={adding}
+              className="w-full rounded-xl bg-purple-600 px-4 py-3 text-sm font-semibold text-white hover:bg-purple-500 disabled:opacity-50">
+              {adding ? "Adding…" : "Add employee"}
+            </button>
+          </div>
+          <p className="text-xs text-slate-500 sm:col-span-2">
+            Tell the employee their ID and first password. They can change the
+            password from the header after signing in.
+          </p>
+        </form>
+      )}
 
       {/* Success message */}
       {message && (
@@ -212,7 +331,7 @@ export default function ManageUsers() {
                       </p>
 
                       <p className="mt-1 text-xs text-slate-500">
-                        ID: {user.id}
+                        Employee ID: {user.employee_id || "not set"}
                       </p>
                     </td>
 
@@ -246,6 +365,9 @@ export default function ManageUsers() {
 
                     <td className="px-5 py-4 text-slate-300">
                       {formatStorage(user.storage_used_bytes)}
+                      <span className="text-slate-500">
+                        {" "}/ {formatStorage(user.quota_bytes)}
+                      </span>
                     </td>
 
                     <td className="px-5 py-4">
@@ -304,9 +426,9 @@ export default function ManageUsers() {
           {/* User details */}
           <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             <div className="rounded-xl bg-slate-800/70 p-4">
-              <p className="text-sm text-slate-400">User ID</p>
+              <p className="text-sm text-slate-400">Employee ID</p>
               <p className="mt-2 font-semibold text-white">
-                {selectedUser.id}
+                {selectedUser.employee_id || "not set"}
               </p>
             </div>
 
@@ -347,9 +469,33 @@ export default function ManageUsers() {
             <div className="rounded-xl bg-slate-800/70 p-4">
               <p className="text-sm text-slate-400">Storage used</p>
               <p className="mt-2 font-semibold text-white">
-                {formatStorage(selectedUser.storage_used_bytes)}
+                {formatStorage(selectedUser.storage_used_bytes)} of{" "}
+                {formatStorage(selectedUser.quota_bytes)}
               </p>
             </div>
+          </div>
+
+          {/* Storage allowance */}
+          <div className="mt-6 flex flex-wrap items-end gap-3 border-t border-slate-800 pt-5">
+            <label className="text-sm text-slate-300">
+              Storage allowance (MB)
+              <input
+                type="number"
+                min="1"
+                value={quotaInput}
+                onChange={(event) => setQuotaInput(event.target.value)}
+                placeholder={String(Math.round((selectedUser.quota_bytes || 0) / 1048576))}
+                className="mt-2 block w-48 rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm text-white outline-none focus:border-purple-500"
+              />
+            </label>
+            <button
+              type="button"
+              disabled={actionLoading || !quotaInput}
+              onClick={() => handleQuota(selectedUser)}
+              className="rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white hover:bg-indigo-500 disabled:opacity-50"
+            >
+              Save allowance
+            </button>
           </div>
 
           {/* Block / Unblock controls */}

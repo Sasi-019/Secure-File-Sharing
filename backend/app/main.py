@@ -11,8 +11,8 @@ from app.database import get_db
 from app.routers import routes as auth
 from app.routers import movies
 from app.routers import admin
-from app.routers import sharing
 from app.routers import stats
+from app.routers import social
 
 load_dotenv()
 
@@ -51,17 +51,17 @@ app.add_middleware(
 # Authentication endpoints
 app.include_router(auth.router)
 
-# Movie endpoints
+# File endpoints
 app.include_router(movies.router)
 
 # Admin endpoints
 app.include_router(admin.router)
 
-# Movie sharing endpoints
-app.include_router(sharing.router)
-
 # Personal statistics endpoints
 app.include_router(stats.router)
+
+# People, notifications and messages
+app.include_router(social.router)
 
 
 @app.get("/")

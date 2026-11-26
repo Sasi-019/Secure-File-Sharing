@@ -1,10 +1,19 @@
-export default function Header({ user, onLogout }) {
+import NotificationBell from "./NotificationBell";
+
+export default function Header({
+  user,
+  onLogout,
+  onOpenNotification,
+  onOpenMessages,
+  onChangePassword,
+  bellRefreshKey = 0,
+}) {
   const isAdmin = user?.role === "admin";
 
   const displayName = user?.name || user?.email || "User";
 
   return (
-    <header className="border-b border-slate-800 bg-slate-950">
+    <header className="border-b-2 border-indigo-500/40 bg-slate-900 shadow-lg shadow-black/40">
       <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4 px-5 py-5 sm:px-8">
         {/* FileShare branding */}
         <div className="flex items-center gap-3">
@@ -18,7 +27,7 @@ export default function Header({ user, onLogout }) {
             </h1>
 
             <p className="text-xs text-slate-400">
-              Private file sharing with owner approval
+              Your company file portal
             </p>
           </div>
         </div>
@@ -31,9 +40,31 @@ export default function Header({ user, onLogout }) {
             </p>
 
             <p className="text-xs text-slate-400">
+              {user?.employee_id ? `ID ${user.employee_id} · ` : ""}
               {user?.email}
             </p>
           </div>
+
+          <NotificationBell
+            onOpen={onOpenNotification}
+            refreshKey={bellRefreshKey}
+          />
+
+          <button
+            type="button"
+            onClick={onOpenMessages}
+            className="rounded-xl border border-slate-700 px-4 py-2.5 text-sm font-medium text-slate-300 transition hover:border-indigo-500 hover:text-white"
+          >
+            ✉️ Messages
+          </button>
+
+          <button
+            type="button"
+            onClick={onChangePassword}
+            className="hidden rounded-xl border border-slate-700 px-4 py-2.5 text-sm font-medium text-slate-300 transition hover:border-indigo-500 hover:text-white md:block"
+          >
+            Password
+          </button>
 
           <span
             className={`rounded-full border px-3 py-1.5 text-xs font-semibold ${

@@ -19,6 +19,17 @@ from fastapi import (
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app.categories import VISIBILITIES, file_category
+from app.company import (
+    can_see_file,
+    check_recipients,
+    notify,
+    parse_recipient_ids,
+    quota_for,
+    set_shares,
+    shared_with,
+    used_by,
+)
 from app.database import get_db
 
 from app.routers.routes import get_current_user
@@ -33,8 +44,8 @@ from app.transfers import (
 )
 
 from app.models import (
+    FileShare,
     Movie,
-    SharingRequest,
     TransferEvent,
     User,
 )
@@ -90,15 +101,16 @@ def get_s3_client():
 def serialize_movie(
     movie: Movie,
     uploader: User | None = None,
-    my_request_status: str | None = None,
+    current_user_id: int | None = None,
+    recipients: list | None = None,
 ):
     """
     Convert a file database record into a response.
 
     Includes uploader details but never exposes the private
-    Backblaze storage key. ``my_request_status`` is the signed-in user's
-    own access request for this file: None, "pending", "accepted" or
-    "rejected".
+    Backblaze storage key. ``category`` (images, videos, pdfs, ...) is worked
+    out from the file type, and ``is_owner`` tells the page which buttons to
+    show.
     """
 
     result = {
@@ -109,9 +121,29 @@ def serialize_movie(
         "content_type": movie.content_type,
         "file_size": movie.file_size,
         "owner_id": movie.owner_id,
+        "visibility": movie.visibility,
+        "category": file_category(movie.original_filename, movie.content_type),
+        "is_owner": (
+            current_user_id is not None
+            and movie.owner_id == current_user_id
+        ),
         "created_at": movie.created_at,
-        "my_request_status": my_request_status,
+        # A public file posted by the administrator is an announcement.
+        "is_announcement": (
+            movie.visibility == "public"
+            and uploader is not None
+            and uploader.role == "admin"
+        ),
+        "shared_with_me": (
+            movie.visibility == "shared"
+            and current_user_id is not None
+            and movie.owner_id != current_user_id
+        ),
     }
+
+    # Only the owner is told who a file is shared with.
+    if recipients is not None and result["is_owner"]:
+        result["shared_with"] = recipients
 
     # Include uploader information when the user record is available.
     if uploader is not None:
@@ -119,20 +151,76 @@ def serialize_movie(
             "id": uploader.id,
             "name": uploader.name,
             "email": uploader.email,
+            "role": uploader.role,
         }
 
     return result
 
 
-def request_statuses_for(db: Session, user_id: int) -> dict[int, str]:
-    """{file id: status} of every access request this user has made."""
-    rows = (
-        db.query(SharingRequest.movie_id, SharingRequest.status)
-        .filter(SharingRequest.requester_id == user_id)
+def recipients_of(db: Session, movie: Movie) -> list[dict]:
+    """The people (id, name) a shared file has been shared with."""
+    out = []
+    for uid in shared_with(db, movie.id):
+        person = db.query(User).filter(User.id == uid).first()
+        if person is not None:
+            out.append({"id": person.id, "name": person.name})
+    return out
+
+
+def visible_to(user: User, db: Session):
+    """
+    SQL condition: the files this user may see and download.
+
+    * their own files, whatever the setting;
+    * every other ACTIVE user's PUBLIC files;
+    * files another person SHARED with them.
+
+    Administrators get no extra access: another user's private or shared
+    file stays invisible to them too, unless it was shared with them.
+    """
+    shared_ids = [
+        int(r[0])
+        for r in db.query(FileShare.movie_id)
+        .filter(FileShare.user_id == user.id)
         .all()
+    ]
+
+    return (
+        (Movie.owner_id == user.id)
+        | ((Movie.visibility == "public") & (User.is_active.is_(True)))
+        | ((Movie.visibility == "shared") & (Movie.id.in_(shared_ids)))
     )
 
-    return {movie_id: request_status for movie_id, request_status in rows}
+
+def clean_visibility(value: str) -> str:
+    value = (value or "").strip().lower()
+
+    if value not in VISIBILITIES:
+        raise HTTPException(
+            status_code=400,
+            detail="Visibility must be 'private', 'public' or 'shared'.",
+        )
+
+    return value
+
+
+def announce_public(db: Session, movie: Movie, owner: User) -> None:
+    """Tell every other active employee that a file went public."""
+    people = (
+        db.query(User.id)
+        .filter(User.is_active.is_(True))
+        .all()
+    )
+    ids = [int(r[0]) for r in people if int(r[0]) != owner.id]
+
+    if owner.role == "admin":
+        text = f"Announcement from {owner.name}: '{movie.title}'"
+        kind = "announcement"
+    else:
+        text = f"{owner.name} posted '{movie.title}' for everyone."
+        kind = "public_file"
+
+    notify(db, ids, kind, text, movie.id)
 
 
 # --------------------------------------------------
@@ -143,6 +231,8 @@ def request_statuses_for(db: Session, user_id: int) -> dict[int, str]:
 async def upload_movie(
     title: str = Form(...),
     description: str = Form(""),
+    visibility: str = Form("private"),
+    recipients: str = Form(""),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -150,6 +240,16 @@ async def upload_movie(
     """Upload a file to private B2 storage."""
 
     title = title.strip()
+    visibility = clean_visibility(visibility)
+    people = check_recipients(
+        db, current_user, parse_recipient_ids(recipients)
+    )
+
+    if visibility == "shared" and not people:
+        raise HTTPException(
+            status_code=400,
+            detail="Choose at least one person to share the file with.",
+        )
 
     if not title or len(title) > 200:
         raise HTTPException(
@@ -196,6 +296,20 @@ async def upload_movie(
                 detail="The maximum upload size is 100 MB.",
             )
 
+        # Each person has a storage allowance.
+        quota = quota_for(current_user)
+        used = used_by(db, current_user.id)
+
+        if used + len(contents) > quota:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "Not enough storage left. You have used "
+                    f"{used // (1024 * 1024)} MB of {quota // (1024 * 1024)} MB. "
+                    "Delete a file or ask the administrator for more space."
+                ),
+            )
+
         # A very long "extension" is just part of an odd filename.
         safe_extension = extension if len(extension) <= 12 else ""
 
@@ -224,10 +338,25 @@ async def upload_movie(
             content_type=content_type,
             file_size=len(contents),
             owner_id=current_user.id,
+            visibility=visibility,
         )
 
         try:
             db.add(movie)
+            db.flush()
+
+            if visibility == "shared":
+                set_shares(db, movie, people)
+                notify(
+                    db,
+                    [p.id for p in people],
+                    "shared_file",
+                    f"{current_user.name} shared '{title}' with you.",
+                    movie.id,
+                )
+            elif visibility == "public":
+                announce_public(db, movie, current_user)
+
             db.commit()
             db.refresh(movie)
 
@@ -266,6 +395,8 @@ async def upload_movie(
             "movie": serialize_movie(
                 movie,
                 uploader=current_user,
+                current_user_id=current_user.id,
+                recipients=recipients_of(db, movie),
             ),
         }
 
@@ -283,33 +414,38 @@ def list_movies(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Every authenticated user can see all uploaded files
-    and their uploader's name and email, together with their own
-    access-request status for each file.
-
-    Download permissions are enforced separately by the
-    download endpoint.
+    The files the signed-in user may see: all of their own files plus every
+    other user's PUBLIC files. Other people's private files never appear,
+    not even for administrators.
 
     Private storage keys are never returned.
     """
 
-    movies_with_uploaders = (
+    rows = (
         db.query(Movie, User)
         .join(User, Movie.owner_id == User.id)
+        .filter(visible_to(current_user, db))
         .order_by(Movie.created_at.desc())
         .all()
     )
-
-    my_requests = request_statuses_for(db, current_user.id)
 
     movies = [
         serialize_movie(
             movie,
             uploader=uploader,
-            my_request_status=my_requests.get(movie.id),
+            current_user_id=current_user.id,
+            recipients=(
+                recipients_of(db, movie)
+                if movie.visibility == "shared"
+                and movie.owner_id == current_user.id
+                else None
+            ),
         )
-        for movie, uploader in movies_with_uploaders
+        for movie, uploader in rows
     ]
+
+    # Announcements from the administrator stay at the top.
+    movies.sort(key=lambda m: not m["is_announcement"])
 
     return {
         "total": len(movies),
@@ -327,9 +463,8 @@ def search_movies(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Search files by title or description.
-
-    Returns matching files with uploader details.
+    Search the files you may see (your own plus others' public files) by
+    title or description. Returns matching files with uploader details.
     Private Backblaze storage keys are never returned.
     """
 
@@ -353,21 +488,20 @@ def search_movies(
         db.query(Movie, User)
         .join(User, Movie.owner_id == User.id)
         .filter(
+            visible_to(current_user, db),
             Movie.title.ilike(search_pattern)
-            | Movie.description.ilike(search_pattern)
+            | Movie.description.ilike(search_pattern),
         )
         .order_by(Movie.created_at.desc())
         .limit(50)
         .all()
     )
 
-    my_requests = request_statuses_for(db, current_user.id)
-
     movies = [
         serialize_movie(
             movie,
             uploader=uploader,
-            my_request_status=my_requests.get(movie.id),
+            current_user_id=current_user.id,
         )
         for movie, uploader in results
     ]
@@ -392,13 +526,13 @@ def download_movie(
     """
     Create a short-lived download link for a file.
 
-    Access is allowed only to:
-    1. The file's owner.
-    2. A user whose access request the owner has accepted.
+    Allowed for:
+    1. The file's owner (public or private file).
+    2. Anyone signed in, administrators included, when the file is PUBLIC
+       and its owner's account is active.
 
-    Administrators get no special access: they must request a file and be
-    accepted like everyone else. The file's owner must still be active.
-    Private Backblaze storage keys are never returned.
+    A private file that is not yours answers "not found", so its existence
+    is not revealed. Private Backblaze storage keys are never returned.
     """
 
     # 1. Reject inactive users.
@@ -421,42 +555,28 @@ def download_movie(
             detail="File not found.",
         )
 
-    # 3. Confirm that the file's owner exists and is active.
-    owner = (
-        db.query(User)
-        .filter(User.id == movie.owner_id)
-        .first()
-    )
-
-    if owner is None or not owner.is_active:
-        raise HTTPException(
-            status_code=403,
-            detail="This file's owner is inactive.",
-        )
-
-    # 4. The owner may always download. Everyone else needs an accepted
-    # request for this exact file.
     is_owner = movie.owner_id == current_user.id
 
+    # 3. A file that is not yours, not public and not shared with you is
+    # invisible to you.
+    if not can_see_file(db, current_user, movie):
+        raise HTTPException(
+            status_code=404,
+            detail="File not found.",
+        )
+
+    # 4. A public file of a blocked owner cannot be downloaded.
     if not is_owner:
-        accepted_request = (
-            db.query(SharingRequest)
-            .filter(
-                SharingRequest.movie_id == movie.id,
-                SharingRequest.requester_id == current_user.id,
-                SharingRequest.owner_id == movie.owner_id,
-                SharingRequest.status == "accepted",
-            )
+        owner = (
+            db.query(User)
+            .filter(User.id == movie.owner_id)
             .first()
         )
 
-        if accepted_request is None:
+        if owner is None or not owner.is_active:
             raise HTTPException(
                 status_code=403,
-                detail=(
-                    "You need the owner's approval to download this "
-                    "file. Request access first."
-                ),
+                detail="This file's owner is inactive.",
             )
 
     # 5. Issue a short-lived signed link to the measured download endpoint.
@@ -469,9 +589,107 @@ def download_movie(
         "message": "Download link generated successfully.",
         "movie_id": movie.id,
         "title": movie.title,
+        "filename": movie.original_filename,
+        "file_size": movie.file_size,
         "download_path": build_stream_path(ticket),
         "expires_in_seconds": DOWNLOAD_TICKET_SECONDS,
-        "access_type": "owner" if is_owner else "shared",
+        "access_type": (
+            "owner"
+            if is_owner
+            else ("shared" if movie.visibility == "shared" else "public")
+        ),
+    }
+
+
+# --------------------------------------------------
+# 4a. CHANGE A FILE'S VISIBILITY (OWNER ONLY)
+# --------------------------------------------------
+
+class VisibilityChange(BaseModel):
+    visibility: str
+    # Needed when visibility is "shared": the people to share with.
+    recipients: list[int] = []
+
+
+@router.patch("/{movie_id}/visibility")
+def change_visibility(
+    movie_id: int,
+    change: VisibilityChange,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Make one of your own files private, public or shared with people."""
+
+    visibility = clean_visibility(change.visibility)
+
+    if not current_user.is_active:
+        raise HTTPException(
+            status_code=403,
+            detail="Your account is inactive.",
+        )
+
+    movie = (
+        db.query(Movie)
+        .filter(Movie.id == movie_id)
+        .first()
+    )
+
+    # Another user's file is reported as missing, public or not.
+    if movie is None or movie.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=404,
+            detail="File not found.",
+        )
+
+    people = check_recipients(
+        db, current_user, parse_recipient_ids(change.recipients)
+    )
+
+    if visibility == "shared" and not people:
+        raise HTTPException(
+            status_code=400,
+            detail="Choose at least one person to share the file with.",
+        )
+
+    was_public = movie.visibility == "public"
+    movie.visibility = visibility
+
+    try:
+        if visibility == "shared":
+            added = set_shares(db, movie, people)
+            notify(
+                db,
+                [p.id for p in added],
+                "shared_file",
+                f"{current_user.name} shared '{movie.title}' with you.",
+                movie.id,
+            )
+        else:
+            # Private and public files have no list of people.
+            set_shares(db, movie, [])
+
+        if visibility == "public" and not was_public:
+            announce_public(db, movie, current_user)
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Could not change the file's visibility.",
+        )
+
+    label = {
+        "public": "public",
+        "private": "private",
+        "shared": "shared with the chosen people",
+    }[visibility]
+
+    return {
+        "message": f"'{movie.title}' is now {label}.",
+        "movie_id": movie.id,
+        "visibility": visibility,
+        "shared_with": recipients_of(db, movie),
     }
 
 
@@ -531,8 +749,7 @@ def delete_movie(
     """
     Delete a file for good. Only its owner can do this.
 
-    The stored data is removed first, then the database record (which also
-    removes its access requests). If storage fails nothing is changed, and
+    The stored data is removed first, then the database record. If storage fails nothing is changed, and
     if the record cannot be removed afterwards, pressing Delete again
     finishes the job because removing a missing object is harmless.
     """
@@ -556,6 +773,13 @@ def delete_movie(
         )
 
     if movie.owner_id != current_user.id:
+        # A file you cannot see is not even reported as existing.
+        if not can_see_file(db, current_user, movie):
+            raise HTTPException(
+                status_code=404,
+                detail="File not found.",
+            )
+
         raise HTTPException(
             status_code=403,
             detail="Only the owner can delete this file.",

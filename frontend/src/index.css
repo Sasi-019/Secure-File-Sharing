@@ -1,5 +1,56 @@
 @import "tailwindcss";
 
+/* ---- Colour theme -------------------------------------------------------
+   A deep navy page, lighter navy section panels and clearly visible borders,
+   so every section stands out from the page and from its neighbours. */
+@theme {
+  --color-slate-950: #070b18;
+  --color-slate-900: #0d1430;
+  --color-slate-800: #25335f;
+  --color-slate-700: #364a82;
+  --color-slate-600: #4a5f9b;
+  --color-slate-500: #7284b8;
+  --color-slate-400: #9aa8d2;
+  --color-slate-300: #c3cdea;
+  --color-slate-200: #dfe5f6;
+}
+
+/* ---- Section panels -----------------------------------------------------
+   <section class="panel panel-indigo"> gets a coloured top bar, a lighter
+   background than the page and a clear border. */
+.panel {
+  position: relative;
+  margin-bottom: 2rem;
+  padding: 1.75rem 1.5rem 1.5rem;
+  border: 1px solid #2f4175;
+  border-radius: 1.25rem;
+  background: linear-gradient(180deg, #172250 0%, #121b42 100%);
+  box-shadow: 0 14px 34px -14px rgba(0, 0, 0, 0.7);
+  overflow: hidden;
+}
+
+.panel::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 5px;
+  background: var(--tone, #6366f1);
+}
+
+.panel-indigo { --tone: #6366f1; }
+.panel-emerald { --tone: #10b981; }
+.panel-sky { --tone: #0ea5e9; }
+.panel-amber { --tone: #f59e0b; }
+.panel-purple { --tone: #a855f7; }
+
+.panel h2 { letter-spacing: -0.01em; }
+
+body {
+  background:
+    radial-gradient(1200px 500px at 50% -10%, rgba(99, 102, 241, 0.18), transparent 70%),
+    #070b18;
+}
+
 html {
   min-width: 320px;
   min-height: 100%;

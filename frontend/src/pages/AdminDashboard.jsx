@@ -12,7 +12,7 @@ export default function AdminDashboard({ stats }) {
   };
 
   return (
-    <section className="mb-8">
+    <section className="panel panel-purple">
       <div className="mb-4">
         <p className="text-sm font-medium text-purple-400">
           ADMINISTRATOR

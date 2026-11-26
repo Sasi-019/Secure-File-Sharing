@@ -44,6 +44,21 @@ class User(Base):
         nullable=False,
     )
 
+    # Company employee ID card number. Unique; used to sign in.
+    employee_id: Mapped[str | None] = mapped_column(
+        String(30),
+        unique=True,
+        index=True,
+        nullable=True,
+    )
+
+    # Storage this person may use, in bytes. NULL means the company
+    # default (DEFAULT_QUOTA_MB in backend/.env).
+    storage_quota_bytes: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+    )
+
     role: Mapped[str] = mapped_column(
         String(20),
         default="user",
@@ -87,6 +102,13 @@ class User(Base):
 
 class Movie(Base):
     __tablename__ = "movies"
+
+    __table_args__ = (
+        CheckConstraint(
+            "visibility IN ('private', 'public', 'shared')",
+            name="ck_movies_visibility",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(
         Integer,
@@ -133,6 +155,17 @@ class Movie(Base):
         index=True,
     )
 
+    # "private": only the owner can see and download the file.
+    # "public": every signed-in user (administrators included) can.
+    # "shared": the owner plus the people listed in file_shares.
+    visibility: Mapped[str] = mapped_column(
+        String(10),
+        nullable=False,
+        default="private",
+        server_default="private",
+        index=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -149,6 +182,93 @@ class Movie(Base):
     )
 
 
+class FileShare(Base):
+    """One person a file has been shared with (visibility "shared")."""
+
+    __tablename__ = "file_shares"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "movie_id",
+            "user_id",
+            name="uq_file_shares_movie_user",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        index=True,
+    )
+
+    movie_id: Mapped[int] = mapped_column(
+        ForeignKey("movies.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+
+class Message(Base):
+    """A one-to-one message, optionally with one of the sender's files."""
+
+    __tablename__ = "messages"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        index=True,
+    )
+
+    sender_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    recipient_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    body: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    # A file the sender attached. It is shared with the recipient only.
+    movie_id: Mapped[int | None] = mapped_column(
+        ForeignKey("movies.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    read_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+
+# NOTE: SharingRequest, SharingQRToken and MovieAccessGrant are no longer
+# used; their tables are kept so no data is destroyed. Notification is used
+# again, for the bell icon.
 class SharingRequest(Base):
     __tablename__ = "sharing_requests"
 
@@ -249,6 +369,13 @@ class Notification(Base):
         index=True,
     )
 
+    # The file this notification is about (if any).
+    movie_id: Mapped[int | None] = mapped_column(
+        ForeignKey("movies.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    # "announcement", "public_file", "shared_file" or "message".
     type: Mapped[str] = mapped_column(
         String(50),
         nullable=False,
